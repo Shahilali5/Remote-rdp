@@ -1,0 +1,725 @@
+name: 🚀 Multi-Emulator RDP Session
+
+on:
+  workflow_dispatch:
+    inputs:
+      emulator_type:
+        description: 'Select Emulator Type'
+        required: true
+        default: 'android'
+        type: choice
+        options:
+          - android
+          - android_google
+          - android_x86
+          - ios
+          - windows_vm
+          - linux_vm
+          - docker
+          - bluestacks
+          - ldplayer
+          - memu
+          - nox
+          - genymotion
+          - xcode
+          - visual_studio
+          - all
+      
+      session_hours:
+        description: 'Session Duration (Hours)'
+        required: true
+        default: '2'
+        type: number
+        min: 1
+        max: 6
+      
+      ngrok_enabled:
+        description: 'Enable Ngrok Tunnel'
+        required: false
+        default: false
+        type: boolean
+      
+      ngrok_region:
+        description: 'Ngrok Region'
+        required: false
+        default: 'us'
+        type: choice
+        options:
+          - us
+          - eu
+          - ap
+          - au
+          - sa
+          - jp
+          - in
+      
+      android_version:
+        description: 'Android Version'
+        required: false
+        default: '33'
+        type: choice
+        options:
+          - '33'  # Android 13
+          - '32'  # Android 12L
+          - '31'  # Android 12
+          - '30'  # Android 11
+          - '29'  # Android 10
+          - '28'  # Android 9
+      
+      ios_version:
+        description: 'iOS Version (macOS Only)'
+        required: false
+        default: '16.0'
+        type: choice
+        options:
+          - '17.0'
+          - '16.4'
+          - '16.0'
+          - '15.5'
+          - '14.5'
+      
+      windows_version:
+        description: 'Windows VM Version'
+        required: false
+        default: 'win10'
+        type: choice
+        options:
+          - win10
+          - win11
+          - win8
+          - winserver2019
+      
+      linux_distro:
+        description: 'Linux Distribution'
+        required: false
+        default: 'ubuntu'
+        type: choice
+        options:
+          - ubuntu
+          - debian
+          - centos
+          - fedora
+          - arch
+      
+      memory_gb:
+        description: 'Memory (GB)'
+        required: false
+        default: '4'
+        type: number
+        min: 2
+        max: 8
+      
+      cpu_cores:
+        description: 'CPU Cores'
+        required: false
+        default: '2'
+        type: number
+        min: 1
+        max: 4
+      
+      auto_heal:
+        description: 'Enable Auto-Healing'
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  multi-emulator-rdp:
+    runs-on: windows-latest
+    timeout-minutes: ${{ fromJSON(github.event.inputs.session_hours) * 60 }}
+    
+    steps:
+    # ============================================
+    # STEP 1: Environment Setup
+    # ============================================
+    - name: 🛠️ Environment Setup
+      id: setup
+      run: |
+        Write-Host "============================================"
+        Write-Host "🎯 MULTI-EMULATOR RDP SESSION"
+        Write-Host "============================================"
+        Write-Host "Started: $(Get-Date)"
+        Write-Host "Emulator: ${{ github.event.inputs.emulator_type }}"
+        Write-Host "Duration: ${{ github.event.inputs.session_hours }} hours"
+        Write-Host "Memory: ${{ github.event.inputs.memory_gb }}GB"
+        Write-Host "CPU Cores: ${{ github.event.inputs.cpu_cores }}"
+        Write-Host "============================================"
+        
+        # Generate secure password
+        $chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*"
+        $password = -join ((1..20) | ForEach { Get-Random -InputObject $chars.ToCharArray() })
+        
+        # Set password
+        $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+        Set-LocalUser -Name "runneradmin" -Password $securePassword
+        
+        # Save password
+        "password=$password" >> $env:GITHUB_OUTPUT
+        Write-Host "✅ Password generated"
+        
+        # Enable RDP with optimizations
+        Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0 -Force
+        Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 0 -Force
+        Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "MaxInstanceCount" -Value 9999 -Force
+        
+        # Performance tweaks
+        Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "MaxColorDepth" -Value 32 -Force
+        
+        # Firewall
+        netsh advfirewall firewall delete rule name="RDP-TCP" 2>$null
+        netsh advfirewall firewall add rule name="RDP-TCP" dir=in action=allow protocol=TCP localport=3389
+        
+        # Start service
+        Set-Service -Name TermService -StartupType Automatic
+        Start-Service TermService
+        
+        # Get IP
+        $ip = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.IPAddress -like "*.*.*.*" -and $_.InterfaceAlias -notlike "*Loopback*" -and $_.InterfaceAlias -notlike "*Virtual*"} | Select-Object -First 1).IPAddress
+        "ip=$ip" >> $env:GITHUB_OUTPUT
+        
+        # Create directories
+        New-Item -ItemType Directory -Force -Path "C:\emulator-data"
+        New-Item -ItemType Directory -Force -Path "C:\logs"
+        
+        Write-Host "✅ Environment configured"
+
+    # ============================================
+    # STEP 2: Install Chocolatey
+    # ============================================
+    - name: 📦 Install Chocolatey
+      run: |
+        Set-ExecutionPolicy Bypass -Scope Process -Force
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+        iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+        Write-Host "✅ Chocolatey installed"
+
+    # ============================================
+    # STEP 3: Android Emulators
+    # ============================================
+    - name: 📱 Android Emulator Setup
+      if: contains(github.event.inputs.emulator_type, 'android') || github.event.inputs.emulator_type == 'all'
+      run: |
+        Write-Host "📱 Installing Android Emulator..."
+        
+        $android_ver = "${{ github.event.inputs.android_version || '33' }}"
+        
+        # Install Android Studio
+        choco install androidstudio openjdk11 -y --limit-output
+        
+        # Setup environment
+        $android_home = "C:\Program Files\Android\Android Studio\sdk"
+        $env:ANDROID_HOME = $android_home
+        $env:PATH += ";$android_home\emulator;$android_home\tools;$android_home\tools\bin;$android_home\platform-tools"
+        
+        # Accept licenses
+        echo "y" | sdkmanager --licenses 2>$null
+        
+        # Install system images
+        sdkmanager "system-images;android-$android_ver;google_apis;x86_64"
+        sdkmanager "emulator" "platform-tools" "platforms;android-$android_ver"
+        
+        # Create AVD with optimized settings
+        avdmanager create avd -n AndroidEmulator -k "system-images;android-$android_ver;google_apis;x86_64" -d "pixel_6" -f
+        
+        Write-Host "✅ Android Emulator installed"
+        
+        # Set environment variable for future steps
+        echo "ANDROID_HOME=$android_home" >> $env:GITHUB_ENV
+
+    - name: 🚀 Start Android Emulator
+      if: contains(github.event.inputs.emulator_type, 'android') || github.event.inputs.emulator_type == 'all'
+      run: |
+        Write-Host "🚀 Starting Android Emulator..."
+        
+        $android_home = $env:ANDROID_HOME
+        $memory = "${{ github.event.inputs.memory_gb || 4 }}"
+        $cores = "${{ github.event.inputs.cpu_cores || 2 }}"
+        
+        # Start with optimized parameters
+        & "$android_home\emulator\emulator.exe" -avd AndroidEmulator -no-window -no-audio -gpu auto -memory $memory -cores $cores &
+        
+        # Wait for boot
+        Write-Host "⏳ Waiting for emulator to boot..."
+        Start-Sleep -Seconds 120
+        
+        # Verify running
+        if (Get-Process -Name "emulator" -ErrorAction SilentlyContinue) {
+          Write-Host "✅ Android Emulator running"
+        } else {
+          Write-Host "⚠️ Emulator not detected, continuing..."
+        }
+
+    # ============================================
+    # STEP 4: Bluestacks Gaming Emulator
+    # ============================================
+    - name: 🎮 Bluestacks Emulator Setup
+      if: github.event.inputs.emulator_type == 'bluestacks' || github.event.inputs.emulator_type == 'all'
+      run: |
+        Write-Host "🎮 Installing Bluestacks..."
+        
+        # Download Bluestacks
+        Invoke-WebRequest -Uri "https://cdn.bluestacks.com/downloads/windows/nxt/BlueStacksFullInstaller.exe" -OutFile "BlueStacksInstaller.exe"
+        
+        # Silent install
+        Start-Process -FilePath ".\BlueStacksInstaller.exe" -ArgumentList "/S" -Wait
+        
+        Write-Host "✅ Bluestacks installed"
+        
+        # Start Bluestacks
+        Start-Process -FilePath "C:\Program Files\BlueStacks_nxt\HD-StartLauncher.exe" -ArgumentList "--silent"
+
+    # ============================================
+    # STEP 5: LDPlayer Emulator
+    # ============================================
+    - name: 🎮 LDPlayer Emulator Setup
+      if: github.event.inputs.emulator_type == 'ldplayer' || github.event.inputs.emulator_type == 'all'
+      run: |
+        Write-Host "🎮 Installing LDPlayer..."
+        
+        # Download LDPlayer
+        Invoke-WebRequest -Uri "https://www.ldplayer.net/download/ldplayer.exe" -OutFile "LDPlayerInstaller.exe"
+        
+        # Silent install
+        Start-Process -FilePath ".\LDPlayerInstaller.exe" -ArgumentList "/S" -Wait
+        
+        Write-Host "✅ LDPlayer installed"
+
+    # ============================================
+    # STEP 6: MEmu Emulator
+    # ============================================
+    - name: 🎮 MEmu Emulator Setup
+      if: github.event.inputs.emulator_type == 'memu' || github.event.inputs.emulator_type == 'all'
+      run: |
+        Write-Host "🎮 Installing MEmu..."
+        
+        # Download MEmu
+        Invoke-WebRequest -Uri "https://www.memuplay.com/download/MEmu-setup.exe" -OutFile "MEmuInstaller.exe"
+        
+        # Silent install
+        Start-Process -FilePath ".\MEmuInstaller.exe" -ArgumentList "/S" -Wait
+        
+        Write-Host "✅ MEmu installed"
+
+    # ============================================
+    # STEP 7: NoxPlayer Emulator
+    # ============================================
+    - name: 🎮 NoxPlayer Emulator Setup
+      if: github.event.inputs.emulator_type == 'nox' || github.event.inputs.emulator_type == 'all'
+      run: |
+        Write-Host "🎮 Installing NoxPlayer..."
+        
+        # Download NoxPlayer
+        Invoke-WebRequest -Uri "https://www.bignox.com/en/download/fullPackage" -OutFile "NoxInstaller.exe"
+        
+        # Silent install
+        Start-Process -FilePath ".\NoxInstaller.exe" -ArgumentList "/S" -Wait
+        
+        Write-Host "✅ NoxPlayer installed"
+
+    # ============================================
+    # STEP 8: Genymotion Emulator
+    # ============================================
+    - name: 🎮 Genymotion Emulator Setup
+      if: github.event.inputs.emulator_type == 'genymotion' || github.event.inputs.emulator_type == 'all'
+      run: |
+        Write-Host "🎮 Installing Genymotion..."
+        
+        # Download Genymotion (requires account)
+        Invoke-WebRequest -Uri "https://www.genymotion.com/download/Genymotion-Installer.exe" -OutFile "GenymotionInstaller.exe"
+        
+        # Silent install
+        Start-Process -FilePath ".\GenymotionInstaller.exe" -ArgumentList "/S" -Wait
+        
+        Write-Host "✅ Genymotion installed"
+
+    # ============================================
+    # STEP 9: iOS Simulator (macOS only)
+    # ============================================
+    - name: 🍎 iOS Simulator Setup
+      if: github.event.inputs.emulator_type == 'ios'
+      run: |
+        Write-Host "⚠️ iOS Simulator requires macOS runner"
+        Write-Host "This will run on Windows with alternative setup..."
+        
+        # Alternative: Use VMware or VirtualBox with macOS
+        choco install virtualbox vagrant -y --limit-output
+        
+        # Setup macOS VM (Simplified)
+        mkdir -p "C:\ios-vm"
+        cd "C:\ios-vm"
+        
+        # Download macOS base image (requires license)
+        Write-Host "iOS Simulator setup requires macOS environment"
+
+    # ============================================
+    # STEP 10: Windows VM Emulator
+    # ============================================
+    - name: 🪟 Windows VM Setup
+      if: github.event.inputs.emulator_type == 'windows_vm' || github.event.inputs.emulator_type == 'all'
+      run: |
+        Write-Host "🪟 Setting up Windows VM..."
+        
+        # Install VirtualBox
+        choco install virtualbox -y --limit-output
+        
+        # Install Vagrant
+        choco install vagrant -y --limit-output
+        
+        $win_ver = "${{ github.event.inputs.windows_version || 'win10' }}"
+        
+        # Create Vagrantfile
+        @"
+Vagrant.configure("2") do |config|
+  config.vm.box = "gusztavvargadr/$win_ver"
+  config.vm.provider "virtualbox" do |vb|
+    vb.memory = "${{ github.event.inputs.memory_gb || 4 }}"
+    vb.cpus = "${{ github.event.inputs.cpu_cores || 2 }}"
+  end
+end
+"@ | Out-File -FilePath "Vagrantfile"
+        
+        # Start VM
+        vagrant up
+        
+        Write-Host "✅ Windows VM running"
+
+    # ============================================
+    # STEP 11: Linux VM Emulator
+    # ============================================
+    - name: 🐧 Linux VM Setup
+      if: github.event.inputs.emulator_type == 'linux_vm' || github.event.inputs.emulator_type == 'all'
+      run: |
+        Write-Host "🐧 Setting up Linux VM..."
+        
+        # Install VirtualBox
+        choco install virtualbox -y --limit-output
+        
+        # Install Vagrant
+        choco install vagrant -y --limit-output
+        
+        $distro = "${{ github.event.inputs.linux_distro || 'ubuntu' }}"
+        
+        # Create Vagrantfile
+        @"
+Vagrant.configure("2") do |config|
+  config.vm.box = "ubuntu/focal64"
+  config.vm.provider "virtualbox" do |vb|
+    vb.memory = "${{ github.event.inputs.memory_gb || 4 }}"
+    vb.cpus = "${{ github.event.inputs.cpu_cores || 2 }}"
+  end
+  config.vm.network "forwarded_port", guest: 22, host: 2222
+end
+"@ | Out-File -FilePath "Vagrantfile"
+        
+        # Start VM
+        vagrant up
+        
+        Write-Host "✅ Linux VM running"
+
+    # ============================================
+    # STEP 12: Docker Container Emulator
+    # ============================================
+    - name: 🐳 Docker Setup
+      if: github.event.inputs.emulator_type == 'docker' || github.event.inputs.emulator_type == 'all'
+      run: |
+        Write-Host "🐳 Setting up Docker..."
+        
+        # Install Docker
+        choco install docker-desktop -y --limit-output
+        
+        # Start Docker
+        Start-Process -FilePath "C:\Program Files\Docker\Docker\Docker Desktop.exe" -Wait
+        
+        # Wait for Docker to be ready
+        Start-Sleep -Seconds 30
+        
+        # Pull and run Android emulator container
+        docker pull budtmo/docker-android-x86-9.0
+        docker run -d --name android-emulator -p 5555:5555 budtmo/docker-android-x86-9.0
+        
+        # Pull and run Ubuntu container
+        docker pull ubuntu:22.04
+        docker run -d --name ubuntu-container -p 2222:22 ubuntu:22.04 tail -f /dev/null
+        
+        # Pull and run Windows container (requires Windows Server base images)
+        docker pull mcr.microsoft.com/windows:ltsc2022
+        
+        Write-Host "✅ Docker containers running"
+
+    # ============================================
+    # STEP 13: Xcode Simulator
+    # ============================================
+    - name: 📱 Xcode Simulator Setup
+      if: github.event.inputs.emulator_type == 'xcode'
+      run: |
+        Write-Host "📱 Xcode Simulator requires macOS"
+        Write-Host "On Windows, using alternative iOS emulation..."
+        
+        # Alternative: Use Flutter or React Native iOS simulator
+        choco install nodejs git python -y --limit-output
+        
+        # Install React Native
+        npm install -g react-native-cli
+        
+        # Setup iOS emulation using Expo
+        npm install -g expo-cli
+        expo init iOSEmulator --template bare-minimum
+        
+        Write-Host "✅ React Native iOS emulation setup"
+
+    # ============================================
+    # STEP 14: Visual Studio Emulator
+    # ============================================
+    - name: 💻 Visual Studio Emulator Setup
+      if: github.event.inputs.emulator_type == 'visual_studio' || github.event.inputs.emulator_type == 'all'
+      run: |
+        Write-Host "💻 Setting up Visual Studio Android Emulator..."
+        
+        # Install Visual Studio Build Tools
+        choco install visualstudio2022buildtools -y --limit-output
+        
+        # Install Android SDK via VS
+        choco install android-sdk -y --limit-output
+        
+        Write-Host "✅ Visual Studio emulator setup"
+
+    # ============================================
+    # STEP 15: Ngrok Tunnel Setup
+    # ============================================
+    - name: 🌐 Setup Ngrok Tunnel
+      if: github.event.inputs.ngrok_enabled == true
+      id: ngrok
+      run: |
+        Write-Host "🌐 Setting up Ngrok tunnel..."
+        
+        # Download ngrok
+        Invoke-WebRequest -Uri "https://bin.equinox.io/c/4VmDzA7iaHb/ngrok-stable-windows-amd64.zip" -OutFile "ngrok.zip"
+        Expand-Archive -Path "ngrok.zip" -DestinationPath "." -Force
+        
+        # Configure with token
+        .\ngrok.exe config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
+        
+        # Region
+        $region = "${{ github.event.inputs.ngrok_region || 'us' }}"
+        
+        # Start tunnel
+        Start-Process -FilePath ".\ngrok.exe" -ArgumentList "tcp 3389 --region=$region" -NoNewWindow
+        
+        # Wait for ngrok
+        Start-Sleep -Seconds 15
+        
+        # Get connection info
+        try {
+          $ngrok_api = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -ErrorAction Stop
+          $ngrok_url = $ngrok_api.tunnels[0].public_url
+          $ngrok_clean = $ngrok_url -replace "tcp://", ""
+          
+          Write-Host "============================================"
+          Write-Host "🌐 NGROK TUNNEL ACTIVE"
+          Write-Host "============================================"
+          Write-Host "Server: $ngrok_clean"
+          Write-Host "============================================"
+          
+          # Save to output
+          "ngrok_url=$ngrok_url" >> $env:GITHUB_OUTPUT
+          "ngrok_clean=$ngrok_clean" >> $env:GITHUB_OUTPUT
+        } catch {
+          Write-Host "⚠️ Could not connect to ngrok API"
+        }
+
+    # ============================================
+    # STEP 16: Display Connection Information
+    # ============================================
+    - name: 📊 Display Connection Info
+      run: |
+        $ip = "${{ steps.setup.outputs.ip }}"
+        $password = "${{ steps.setup.outputs.password }}"
+        $ngrok_url = "${{ steps.ngrok.outputs.ngrok_url }}"
+        $ngrok_clean = "${{ steps.ngrok.outputs.ngrok_clean }}"
+        
+        $emulator_type = "${{ github.event.inputs.emulator_type }}"
+        $session_hours = "${{ github.event.inputs.session_hours }}"
+        
+        # Create connection file
+        @"
+============================================
+🚀 MULTI-EMULATOR RDP CONNECTION INFO
+============================================
+Session Started: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+Session Duration: $session_hours hours
+Emulator Type: $emulator_type
+============================================
+🔗 CONNECTION DETAILS
+============================================
+$(
+if ($ngrok_url) {
+  "Server (Ngrok): $ngrok_clean"
+} else {
+  "Server (Direct): $ip:3389"
+}
+)
+Username: runneradmin
+Password: $password
+============================================
+💡 HOW TO CONNECT
+============================================
+1. Open Remote Desktop Client (mstsc)
+2. Enter server address
+3. Use credentials above
+4. Click Connect
+============================================
+$(
+if ($emulator_type -eq 'android' -or $emulator_type -eq 'all') {
+  @"
+📱 ANDROID EMULATOR COMMANDS
+============================================
+ADB Connect: adb connect localhost:5555
+List Devices: adb devices
+============================================
+"@
+}
+)
+$(
+if ($emulator_type -eq 'docker') {
+  @"
+🐳 DOCKER COMMANDS
+============================================
+List Containers: docker ps
+Access Container: docker exec -it <container-id> bash
+============================================
+"@
+}
+)
+============================================
+"@ | Out-File -FilePath "rdp-connection-info.txt"
+        
+        # Display
+        Get-Content "rdp-connection-info.txt"
+        Write-Host ""
+        Write-Host "📁 Connection info saved to: rdp-connection-info.txt"
+
+    # ============================================
+    # STEP 17: Upload Connection Info
+    # ============================================
+    - name: 📤 Upload Connection Info
+      uses: actions/upload-artifact@v4
+      with:
+        name: rdp-connection-info
+        path: |
+          rdp-connection-info.txt
+          *.log
+        retention-days: 1
+
+    # ============================================
+    # STEP 18: Auto-Healing System
+    # ============================================
+    - name: 🔄 Auto-Healing Monitor
+      if: github.event.inputs.auto_heal == true
+      run: |
+        Write-Host "🔧 Starting Auto-Healing Monitor..."
+        
+        # Create PowerShell monitoring script
+        @'
+while ($true) {
+    # Check RDP service
+    $rdpService = Get-Service -Name TermService -ErrorAction SilentlyContinue
+    if ($rdpService -and $rdpService.Status -ne 'Running') {
+        Write-Host "🔧 Restarting RDP service..."
+        Start-Service -Name TermService
+    }
+    
+    # Check Android emulator
+    $emulator = Get-Process -Name "emulator" -ErrorAction SilentlyContinue
+    if (-not $emulator) {
+        Write-Host "🔧 Restarting emulator..."
+        & "C:\Program Files\Android\Android Studio\sdk\emulator\emulator.exe" -avd AndroidEmulator -no-window -no-audio &
+    }
+    
+    # Check ngrok
+    $ngrok = Get-Process -Name "ngrok" -ErrorAction SilentlyContinue
+    if (-not $ngrok) {
+        Write-Host "🔧 Restarting ngrok..."
+        .\ngrok.exe tcp 3389 &
+    }
+    
+    Start-Sleep -Seconds 120
+}
+'@ | Out-File -FilePath "auto-heal.ps1"
+        
+        # Start in background
+        Start-Process -FilePath "powershell.exe" -ArgumentList "-File auto-heal.ps1" -NoNewWindow -WindowStyle Hidden
+
+    # ============================================
+    # STEP 19: Keep Session Alive
+    # ============================================
+    - name: ⏰ Keep Session Alive
+      run: |
+        Write-Host "⏰ Keeping session alive..."
+        
+        $hours = ${{ github.event.inputs.session_hours || 2 }}
+        $endTime = (Get-Date).AddHours($hours)
+        $counter = 0
+        
+        while ((Get-Date) -lt $endTime) {
+            $remaining = ($endTime - (Get-Date)).ToString('hh\:mm\:ss')
+            $counter++
+            
+            Write-Host ""
+            Write-Host "============================================"
+            Write-Host "🟢 SESSION ACTIVE - $counter"
+            Write-Host "============================================"
+            Write-Host "Time remaining: $remaining"
+            Write-Host "Emulator: ${{ github.event.inputs.emulator_type }}"
+            Write-Host ""
+            
+            # Check running processes
+            $processes = Get-Process | Where-Object {$_.ProcessName -match "emulator|ngrok|docker|VirtualBox|vagrant"} | Select-Object -First 10
+            Write-Host "Active processes:"
+            $processes | ForEach-Object { Write-Host "  - $($_.ProcessName) (PID: $($_.Id))" }
+            
+            Write-Host "============================================"
+            
+            # Update connection info periodically
+            if ($counter % 6 -eq 0) {  # Every 30 minutes
+                Get-Content "rdp-connection-info.txt" | Out-File -FilePath "rdp-connection-info-updated.txt"
+            }
+            
+            Start-Sleep -Seconds 300  # 5 minutes
+        }
+
+    # ============================================
+    # STEP 20: Cleanup All Resources
+    # ============================================
+    - name: 🧹 Cleanup Resources
+      if: always()
+      run: |
+        Write-Host "🧹 Cleaning up all resources..."
+        
+        # Kill Android emulators
+        Get-Process -Name "emulator" -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.Id -Force }
+        Get-Process -Name "qemu-system-x86_64" -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.Id -Force }
+        Get-Process -Name "qemu-system-i386" -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.Id -Force }
+        
+        # Kill gaming emulators
+        Get-Process -Name "BlueStacks*" -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.Id -Force }
+        Get-Process -Name "ldplayer*" -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.Id -Force }
+        Get-Process -Name "MEmu*" -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.Id -Force }
+        Get-Process -Name "Nox*" -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.Id -Force }
+        
+        # Kill virtual machines
+        Get-Process -Name "VirtualBox*" -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.Id -Force }
+        Get-Process -Name "VBox*" -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.Id -Force }
+        
+        # Kill ngrok
+        Get-Process -Name "ngrok" -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.Id -Force }
+        
+        # Kill Docker
+        Get-Process -Name "docker*" -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.Id -Force }
+        
+        # Stop Vagrant VMs
+        if (Get-Command vagrant -ErrorAction SilentlyContinue) {
+          vagrant halt 2>$null
+          vagrant destroy -f 2>$null
+        }
+        
+        Write-Host "✅ Cleanup complete"
